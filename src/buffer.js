@@ -6,6 +6,7 @@
     v86util.AsyncXHRBuffer = AsyncXHRBuffer;
     v86util.AsyncXHRPartfileBuffer = AsyncXHRPartfileBuffer;
     v86util.AsyncFileBuffer = AsyncFileBuffer;
+    v86util.AsyncFileSystemFileBuffer = AsyncFileSystemFileBuffer;
     v86util.SyncFileBuffer = SyncFileBuffer;
 
     // The smallest size the emulated hardware can emit
@@ -698,6 +699,196 @@
 
         var file = new File(parts, name);
         dbg_assert(file.size === this.file.size);
+
+        return file;
+    };
+
+    if(typeof XMLHttpRequest === "undefined")
+    {
+        var determine_size = function(path, cb)
+        {
+            require("fs")["stat"](path, (err, stats) =>
+            {
+                if(err)
+                {
+                    cb(err);
+                }
+                else
+                {
+                    cb(null, stats.size);
+                }
+            });
+        };
+    }
+    else
+    {
+        var determine_size = function(url, cb)
+        {
+            v86util.load_file(url, {
+                done: (buffer, http) =>
+                {
+                    var header = http.getResponseHeader("Content-Range") || "";
+                    var match = header.match(/\/(\d+)\s*$/);
+
+                    if(match)
+                    {
+                        cb(null, +match[1]);
+                    }
+                    else
+                    {
+                        const error = "`Range: bytes=...` header not supported (Got `" + header + "`)";
+                        cb(error);
+                    }
+                },
+                headers: {
+                    Range: "bytes=0-0",
+                }
+            });
+        };
+    }
+
+    /**
+     * Asynchronous access to a File stored in the Origin Private File System, loading blocks from the input type=file
+     *
+     * @constructor
+     */
+    function AsyncFileSystemFileBuffer(file)
+    {
+        this.file = file;
+        this.byteLength = file.size;
+
+        this.onload = undefined;
+        this.onprogress = undefined;
+
+        this.req_id = 0;
+        this.callbacks = {};
+
+        // Create our web worker that does the file operations
+        var blob = new Blob([ '(', this.worker_fn, ')()' ], { type: 'text/javascript' });
+        var url = URL.createObjectURL(blob);
+        this.worker = new Worker(url);
+
+        // Initialize the worker with the correct file
+        this.worker.postMessage({req: "init", file})
+
+        // When the worker finishes an operation, it will send a message and we must call the corresponding callback
+        this.worker.onmessage = function(e)
+        {
+            var id = e.data.id;
+            var buffer = e.data.buffer;
+            var ok = e.data.ok;
+            if (ok) {
+                this.callbacks[id](buffer);
+                delete this.callbacks[id];
+            } else {
+                console.error("AsyncFileBuffer: Worker error: " + e.data.error);
+            }
+        }.bind(this);
+    }
+    AsyncFileSystemFileBuffer.prototype.worker_fn = function() {
+        var srcfile, handle, access;
+        self.onmessage = async function(e) {
+            if (e.data.req == "init") {
+                srcfile = e.data.file;
+                /** @suppress {checkTypes} */
+                const opfs_dir = await navigator.storage.getDirectory();
+                handle = await opfs_dir.getFileHandle(srcfile.name, { create: true });
+                // Now we need to copy in the file
+                const writer = await handle.createWritable();
+                await writer.write(srcfile);
+                await writer.close();
+                /** @suppress {checkTypes} */
+                access = await handle.createSyncAccessHandle();
+            } else if (e.data.req == "get") {
+                let offset = e.data.offset;
+                let len = e.data.len;
+                var buffer = new ArrayBuffer(len);
+                var view = new Uint8Array(buffer);
+                await access.read(view, {at: offset});
+                // Passing [buffer] to postMessage transfers the buffer instead of copying it
+                self.postMessage({id: e.data.id, buffer, ok: true}, undefined, [buffer]);
+            } else if (e.data.req == "set") {
+                let offset = e.data.offset;
+                let buffer = e.data.buffer;
+                await access.write(buffer, {at: offset});
+                self.postMessage({id: e.data.id, ok: true});
+            }
+        }
+    };
+
+
+    AsyncFileSystemFileBuffer.prototype.load = function()
+    {
+        this.onload && this.onload(Object.create(null));
+    };
+
+    /**
+     * @param {number} offset
+     * @param {number} len
+     * @param {function(!Uint8Array)} fn
+     */
+    AsyncFileSystemFileBuffer.prototype.get = function(offset, len, fn)
+    {
+        dbg_assert(offset % BLOCK_SIZE === 0);
+        dbg_assert(len % BLOCK_SIZE === 0);
+        dbg_assert(len);
+
+        var id = this.req_id++;
+        // When the worker finishes the read, it will send a message and the handler will call this function
+        // The worker can't call the callback directly because it's in a different thread
+        this.callbacks[id] = function(buffer) {
+            var block = new Uint8Array(buffer);
+            fn(block);
+        };
+        // Send a message to the worker telling it to read the file
+        this.worker.postMessage({req: "get", id, offset, len});
+    };
+    AsyncFileSystemFileBuffer.prototype.set = function(start, data, fn)
+    {
+        var len = data.length;
+        dbg_assert(start + data.byteLength <= this.byteLength);
+        dbg_assert(start % BLOCK_SIZE === 0);
+        dbg_assert(len % BLOCK_SIZE === 0);
+        dbg_assert(len);
+
+        // TODO
+        console.error("got a write");
+        // var start_block = start / BLOCK_SIZE;
+        // var block_count = len / BLOCK_SIZE;
+
+        // for(var i = 0; i < block_count; i++)
+        // {
+        //     var block = this.block_cache.get(start_block + i);
+
+        //     if(block === undefined)
+        //     {
+        //         const data_slice = data.slice(i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE);
+        //         this.block_cache.set(start_block + i, data_slice);
+        //     }
+        //     else
+        //     {
+        //         const data_slice = data.subarray(i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE);
+        //         dbg_assert(block.byteLength === data_slice.length);
+        //         block.set(data_slice);
+        //     }
+
+        //     this.block_cache_is_write.add(start_block + i);
+        // }
+
+        // fn();
+    };
+
+    AsyncFileSystemFileBuffer.prototype.get_buffer = function(fn)
+    {
+        // TODO: what needs to happen here?
+        // We must load all parts, unlikely a good idea for big files
+        fn();
+    };
+
+    AsyncFileSystemFileBuffer.prototype.get_as_file = function(name)
+    {
+        // TODO: will probably need to flush writes in the web worker
+        var file = new File(this.file, name);
 
         return file;
     };

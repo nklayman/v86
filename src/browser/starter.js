@@ -415,9 +415,9 @@ V86Starter.prototype.continue_init = async function(emulator, options)
                 file.async = file.buffer.size >= 256 * 1024 * 1024;
             }
 
-            if(file.async)
+            if(true)
             {
-                var buffer = new v86util.AsyncFileBuffer(file.buffer);
+                var buffer = new v86util.AsyncFileSystemFileBuffer(file.buffer);
             }
             else
             {
